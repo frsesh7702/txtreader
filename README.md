@@ -23,7 +23,7 @@
 首次运行会自动 pip 安装依赖：
 
 ```
-pip install PyQt5 pygame requests
+pip install PyQt5 pygame
 ```
 
 ### 方式二：打包好的 EXE
