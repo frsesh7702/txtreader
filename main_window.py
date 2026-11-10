@@ -2,7 +2,7 @@
 import os
 import threading
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPalette,
                          QPixmap, QTextCursor)
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
@@ -131,6 +131,8 @@ class BackgroundTextEdit(QTextEdit):
 
 
 class MainWindow(QMainWindow):
+    _export_progress = pyqtSignal(int)   # 子线程 → 主线程 更新进度（跨线程改控件会崩）
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TXT 朗读器 1.0（百度语音）")
@@ -456,12 +458,13 @@ class MainWindow(QMainWindow):
         prog.setWindowModality(Qt.WindowModal)
         prog.setMinimumDuration(0)
         cancelled = threading.Event()
+        self._export_progress.connect(prog.setValue)
 
         def work():
             try:
                 self.player.export_mp3(chunks, self._voice_params(), path,
-                                       lambda i, n: prog.setValue(i))
-                prog.setValue(len(chunks))
+                                       lambda i, n: self._export_progress.emit(i))
+                self._export_progress.emit(len(chunks))
             except Exception as e:
                 if not cancelled.is_set():
                     self.player.error.emit(str(e))

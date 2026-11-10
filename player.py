@@ -40,13 +40,15 @@ class Player(QObject):
         self._threads = []
         self._tmpdir = tempfile.mkdtemp(prefix="reader_tts_")
         self._mixer_ok = False
+        self._lock = threading.RLock()   # 串行化所有 SDL_mixer 调用，避免多线程并发崩溃
+        self._active = False             # 是否处于一次朗读会话中
         self._bgm = {"path": "", "vol": 0.3, "on": False}
-        self._bgm_sound = None
-        self._bgm_channel = None
+        self._bgm_loaded = None
+        self._speech_ch = None           # 人声走通道；伴音走 music 流，二者互不干扰
         try:
             pygame.mixer.init()
             self._mixer_ok = True
-            self._bgm_channel = pygame.mixer.Channel(7)
+            self._speech_ch = pygame.mixer.Channel(0)
         except pygame.error:
             pass
 
@@ -54,45 +56,55 @@ class Player(QObject):
     def set_bgm_volume(self, vol: float):
         """仅调音量（拖动滑杆用，极轻量，不处理开关）。"""
         self._bgm["vol"] = vol
-        if self._mixer_ok and self._bgm_channel:
-            self._bgm_channel.set_volume(vol)
+        if self._mixer_ok:
+            with self._lock:
+                try:
+                    pygame.mixer.music.set_volume(vol)
+                except pygame.error:
+                    pass
 
     def set_bgm(self, path: str, vol: float, on: bool):
         """设置伴音。vol 0.0~1.0。播放中会实时生效。"""
         self._bgm = {"path": path, "vol": vol, "on": on}
-        if self._mixer_ok and self._bgm_channel:
-            self._bgm_channel.set_volume(vol)
-            if not on:
-                self._stop_bgm()
-            elif self.playing and self._state_playing():
-                self._start_bgm()
-
-    def _state_playing(self):
-        return pygame.mixer.music.get_busy()
+        if not self._mixer_ok:
+            return
+        if not on:
+            self._stop_bgm()
+        elif self._active:
+            self._start_bgm()
 
     def _start_bgm(self):
+        """伴音走 mixer.music 流：内存占用恒定，加载瞬时完成。"""
         b = self._bgm
-        if not (self._mixer_ok and b["on"] and b["path"] and os.path.exists(b["path"])):
+        path = b["path"]
+        if not (self._mixer_ok and b["on"] and path and os.path.exists(path)):
             return
         try:
-            if self._bgm_sound is None or self._bgm.get("_loaded") != b["path"]:
-                self._bgm_sound = pygame.mixer.Sound(b["path"])
-                self._bgm["_loaded"] = b["path"]
-            self._bgm_channel.set_volume(b["vol"])
-            if not self._bgm_channel.get_busy():
-                self._bgm_channel.play(self._bgm_sound, loops=-1)
+            with self._lock:
+                if self._bgm_loaded != path:
+                    pygame.mixer.music.load(path)
+                    self._bgm_loaded = path
+                pygame.mixer.music.set_volume(b["vol"])
+                if not pygame.mixer.music.get_busy():
+                    pygame.mixer.music.play(loops=-1)
         except pygame.error as e:
             self.status_text.emit(f"伴音加载失败: {e}")
 
     def _stop_bgm(self):
-        if self._mixer_ok and self._bgm_channel:
-            self._bgm_channel.stop()
+        if not self._mixer_ok:
+            return
+        with self._lock:
+            try:
+                pygame.mixer.music.stop()
+            except pygame.error:
+                pass
 
     # ---------------- 公共控制 ----------------
     def play(self, chunks, voice: dict, start_idx: int = 0, rounds: int = 1):
         self.stop(join=True)
         self._stop.clear()
         self._paused = False
+        self._active = True
         self._cache.clear()
         self._chunks = chunks
         self._voice = voice
@@ -111,30 +123,38 @@ class Player(QObject):
     def pause(self):
         self._paused = True
         if self._mixer_ok:
-            try:
-                pygame.mixer.music.pause()
-            except pygame.error:
-                pass
-            if self._bgm_channel:
-                self._bgm_channel.pause()
+            with self._lock:
+                try:
+                    if self._speech_ch:
+                        self._speech_ch.pause()
+                    pygame.mixer.music.pause()
+                except pygame.error:
+                    pass
         self.state_changed.emit("paused")
 
     def resume(self):
         self._paused = False
         if self._mixer_ok:
-            pygame.mixer.music.unpause()
-            if self._bgm_channel:
-                self._bgm_channel.unpause()
+            with self._lock:
+                try:
+                    if self._speech_ch:
+                        self._speech_ch.unpause()
+                    pygame.mixer.music.unpause()
+                except pygame.error:
+                    pass
         self.state_changed.emit("playing")
 
     def stop(self, join: bool = False):
         self._stop.set()
-        self._stop_bgm()
+        self._active = False
         if self._mixer_ok:
-            try:
-                pygame.mixer.music.stop()
-            except pygame.error:
-                pass
+            with self._lock:
+                try:
+                    if self._speech_ch:
+                        self._speech_ch.stop()
+                except pygame.error:
+                    pass
+        self._stop_bgm()
         if join:
             for t in self._threads:
                 t.join(timeout=2)
@@ -146,11 +166,12 @@ class Player(QObject):
             return
         target = max(0, min(len(self._chunks) - 1, self._cur + delta))
         self._skip_to = target
-        if self._mixer_ok:
-            try:
-                pygame.mixer.music.stop()
-            except pygame.error:
-                pass
+        if self._mixer_ok and self._speech_ch:
+            with self._lock:
+                try:
+                    self._speech_ch.stop()
+                except pygame.error:
+                    pass
 
     @property
     def playing(self):
@@ -186,11 +207,14 @@ class Player(QObject):
                     if not self._stop.is_set():
                         self.error.emit(str(e))
                         self._stop.set()
-                        if self._mixer_ok:
-                            try:
-                                pygame.mixer.music.stop()
-                            except pygame.error:
-                                pass
+                        self._active = False
+                        self._stop_bgm()
+                        if self._mixer_ok and self._speech_ch:
+                            with self._lock:
+                                try:
+                                    self._speech_ch.stop()
+                                except pygame.error:
+                                    pass
                     return
             if not did_work:
                 time.sleep(0.15)
@@ -228,26 +252,29 @@ class Player(QObject):
             self.chunk_started.emit(idx, len(self._chunks))
             self.status_text.emit(f"朗读中 第 {idx + 1}/{len(self._chunks)} 段")
             try:
-                pygame.mixer.music.load(self._cache[idx])
-                vol = self._voice.get("vol", 5) / 15.0
-                pygame.mixer.music.set_volume(max(0.05, vol))
-                pygame.mixer.music.play()
+                snd = pygame.mixer.Sound(self._cache[idx])
             except pygame.error as e:
                 self.error.emit(f"播放失败: {e}")
                 break
+            vol = self._voice.get("vol", 5) / 15.0
+            with self._lock:
+                self._speech_ch.set_volume(max(0.05, vol))
+                self._speech_ch.play(snd)
             # 播放中等待：同时监控 stop / skip / paused
-            while pygame.mixer.music.get_busy() and not self._stop.is_set():
+            while self._speech_ch.get_busy() and not self._stop.is_set():
                 if self._skip_to is not None:
                     break
                 if self._paused:
+                    self._speech_ch.pause()
                     pygame.mixer.music.pause()
                     while self._paused and not self._stop.is_set():
                         time.sleep(0.05)
                     if self._stop.is_set():
                         break
                     if self._skip_to is not None:
-                        pygame.mixer.music.stop()
+                        self._speech_ch.stop()
                         break
+                    self._speech_ch.unpause()
                     pygame.mixer.music.unpause()
                 time.sleep(0.05)
             if self._skip_to is not None:
@@ -255,6 +282,7 @@ class Player(QObject):
             if self._stop.is_set():
                 break
             self._cur += 1
+        self._active = False
         if not self._stop.is_set():
             self._stop_bgm()
             self.state_changed.emit("finished")
