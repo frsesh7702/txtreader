@@ -1,5 +1,6 @@
 """主窗口：仿「朗读女」布局的 TXT 朗读器。"""
 import os
+import subprocess
 import threading
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
@@ -7,7 +8,7 @@ from PyQt5.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPalette,
                          QPixmap, QTextCursor)
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
                              QFileDialog, QHBoxLayout, QLabel, QListWidget,
-                             QListWidgetItem, QMainWindow, QMessageBox,
+                             QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                              QProgressDialog, QPushButton, QSlider, QSpinBox,
                              QStyle, QTextEdit, QVBoxLayout, QWidget)
 
@@ -29,6 +30,8 @@ class PlaylistWindow(QDialog):
         lay.addWidget(QLabel("朗读列表（双击载入）"))
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(mw._load_item)
+        self.list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self._menu)
         lay.addWidget(self.list)
         btns = QHBoxLayout()
         for text, fn in (("＋添加", mw._add_files), ("✕删除", mw._del_file),
@@ -37,6 +40,30 @@ class PlaylistWindow(QDialog):
             b.clicked.connect(fn)
             btns.addWidget(b)
         lay.addLayout(btns)
+
+    def _menu(self, pos):
+        """右键菜单：打开文件所在文件夹并选中该文件。"""
+        item = self.list.itemAt(pos)
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        if not path:
+            return
+        self.list.setCurrentItem(item)
+        menu = QMenu(self)
+        act = menu.addAction("打开文件位置")
+        if menu.exec_(self.list.viewport().mapToGlobal(pos)) is act:
+            self._open_location(path)
+
+    @staticmethod
+    def _open_location(path):
+        if not os.path.exists(path):
+            QMessageBox.warning(None, "文件不存在", f"找不到该文件：\n{path}")
+            return
+        try:
+            subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+        except OSError as e:
+            QMessageBox.warning(None, "无法打开文件夹", str(e))
 
     def closeEvent(self, e):
         e.ignore()
