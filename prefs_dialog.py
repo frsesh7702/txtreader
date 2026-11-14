@@ -163,7 +163,7 @@ class PrefsDialog(QDialog):
             QMessageBox.information(self, "提示", "最多只能添加 5 首备用音乐")
             return
         path, _ = QFileDialog.getOpenFileName(self, "选择伴音音乐", "",
-                                              "音乐文件 (*.mp3 *.wav *.ogg)")
+                                              "音乐文件 (*.mp3 *.m4a *.aac *.wav *.ogg *.flac *.wma)")
         if not path:
             return
         if path in cur:

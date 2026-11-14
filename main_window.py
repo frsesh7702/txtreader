@@ -2,7 +2,7 @@
 import os
 import threading
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import (QBrush, QColor, QFont, QImage, QPainter, QPalette,
                          QPixmap, QTextCursor)
 from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
@@ -32,7 +32,7 @@ class PlaylistWindow(QDialog):
         lay.addWidget(self.list)
         btns = QHBoxLayout()
         for text, fn in (("＋添加", mw._add_files), ("✕删除", mw._del_file),
-                         ("清空", self.list.clear), ("关闭", self.hide)):
+                         ("清空", mw._clear_playlist), ("关闭", self.hide)):
             b = QPushButton(text)
             b.clicked.connect(fn)
             btns.addWidget(b)
@@ -51,6 +51,74 @@ WELCOME = """使用须知：
 
 提示：把小说 txt 直接拖到本窗口也可以加入朗读列表。
 """
+
+
+class SubtitleWindow(QWidget):
+    """桌面字幕：无边框置顶小窗，显示当前朗读的句子，可用鼠标拖动。"""
+
+    def __init__(self, cfg):
+        super().__init__(None, Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowTitle("桌面字幕")
+        self.cfg = cfg
+        self._drag = None
+        self._width = 0
+        self._is_placed = False
+        self.lab = QLabel("")
+        self.lab.setWordWrap(True)
+        self.lab.setAlignment(Qt.AlignCenter)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.lab)
+        self.lab.hide()      # 没有朗读内容时不显示黑底
+        self._apply_style()
+
+    def _apply_style(self):
+        size = int(self.cfg.get("subtitle_size", 22))
+        self.lab.setStyleSheet(
+            "QLabel { background: rgba(0,0,0,175); color: #ffffff;"
+            f" border-radius: 12px; padding: 14px 22px; font-size: {size}px;"
+            " font-family: 'Microsoft YaHei'; }")
+
+    def set_text(self, text):
+        self.lab.setText(text)
+        self.lab.show()
+        if not self._width:
+            scr = QApplication.primaryScreen().availableGeometry()
+            self._width = int(min(scr.width() * 0.7, max(520, 520)))
+        self.lab.setFixedWidth(self._width)
+        h = self.lab.heightForWidth(self._width)
+        if h <= 0:
+            h = self.lab.sizeHint().height()
+        old_h = self.height() if self._is_placed else 0
+        self.setFixedSize(self._width, h)
+        if not self._is_placed:
+            self._place_bottom_center()
+            self._is_placed = True
+        elif h != old_h:          # 增高时向上长，保持底边位置不变
+            self.move(self.x(), self.y() - (h - old_h))
+
+    def clear_text(self):
+        """清空并隐藏文字（透明窗口仍在，避免残留黑底）。"""
+        self.lab.clear()
+        self.lab.hide()
+
+    def _place_bottom_center(self):
+        scr = QApplication.primaryScreen().availableGeometry()
+        x = scr.x() + (scr.width() - self.width()) // 2
+        y = scr.y() + scr.height() - self.height() - 80
+        self.move(int(x), int(y))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = e.globalPos() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.LeftButton:
+            self.move(e.globalPos() - self._drag)
+
+    def mouseReleaseEvent(self, e):
+        self._drag = None
 
 
 class BackgroundTextEdit(QTextEdit):
@@ -144,6 +212,9 @@ class MainWindow(QMainWindow):
         self.player = Player(self.tts)
         self.chunks = []          # 当前文本分段 [(s,e,text)]
         self._state = "stopped"
+        self._cur_path = ""       # 当前载入的 txt 路径（列表循环用）
+        self._cur_idx = -1        # 当前朗读段序号（字幕用）
+        self.subtitle = SubtitleWindow(self.cfg)   # 桌面字幕小窗（默认隐藏）
 
         self._build_ui()
         self._build_menu()
@@ -154,6 +225,12 @@ class MainWindow(QMainWindow):
         # 悬浮朗读列表窗口
         self.playlist_win = PlaylistWindow(self)
         self.playlist = self.playlist_win.list
+        # 恢复上次的朗读列表（跳过已被删除的文件）
+        for p in self.cfg.get("playlist") or []:
+            if isinstance(p, str) and os.path.exists(p):
+                self._add_to_list(p, persist=False)
+        if len(self.cfg.get("playlist") or []) != self.playlist.count():
+            self._save_playlist()
 
         # 恢复上次的背景 / 伴音设置
         self.editor.set_background(self.cfg["bg_path"],
@@ -198,6 +275,15 @@ class MainWindow(QMainWindow):
         self.spin_rounds.setValue(int(self.cfg["rounds"]))
         row1.addWidget(self.spin_rounds)
         row1.addWidget(QLabel("次"))
+        row1.addSpacing(16)
+        row1.addWidget(QLabel("循环："))
+        self.cb_loop = QComboBox()
+        self.cb_loop.addItem("读完停止", 0)
+        self.cb_loop.addItem("单文件循环", 1)
+        self.cb_loop.addItem("列表循环", 2)
+        self.cb_loop.setCurrentIndex(max(0, int(self.cfg.get("loop_mode", 0))))
+        self.cb_loop.setToolTip("单文件循环：读完后重读当前文件\n列表循环：读完后自动读朗读列表的下一本")
+        row1.addWidget(self.cb_loop)
         row1.addSpacing(20)
         btn_export = QPushButton("♫ 生成声音文件")
         btn_export.clicked.connect(self.export_mp3)
@@ -245,6 +331,7 @@ class MainWindow(QMainWindow):
         for s in self.sliders.values():
             s.valueChanged.connect(self._save_voice_cfg)
         self.spin_rounds.valueChanged.connect(self._save_voice_cfg)
+        self.cb_loop.currentIndexChanged.connect(self._save_voice_cfg)
 
     def _build_menu(self):
         mb = self.menuBar()
@@ -262,6 +349,13 @@ class MainWindow(QMainWindow):
         self._add_action(m_read, "停止", self.stop, "F6")
         self._add_action(m_read, "上一段", lambda: self.player.skip(-1), "F7")
         self._add_action(m_read, "下一段", lambda: self.player.skip(1), "F8")
+        m_read.addSeparator()
+        a_sub = QAction("桌面字幕", self)
+        a_sub.setCheckable(True)
+        a_sub.setShortcut("F9")
+        a_sub.setChecked(bool(self.cfg.get("subtitle_on")))
+        a_sub.toggled.connect(self._toggle_subtitle)
+        m_read.addAction(a_sub)
 
         m_opt = mb.addMenu("选项(&O)")
         self._add_action(m_opt, "百度语音设置…", self.open_settings)
@@ -294,6 +388,7 @@ class MainWindow(QMainWindow):
         for k, s in self.sliders.items():
             self.cfg[k] = s.value() + 5 if k == "spd" else s.value()
         self.cfg["rounds"] = self.spin_rounds.value()
+        self.cfg["loop_mode"] = self.cb_loop.currentData()
         config.save(self.cfg)
 
     # ---------------- 设置 / 朗读列表 ----------------
@@ -339,6 +434,7 @@ class MainWindow(QMainWindow):
                 raise ValueError("无法识别文件编码")
             self.stop()
             self.editor.setPlainText(text)
+            self._cur_path = path
             self.setWindowTitle(f"TXT 朗读器 1.0 [ {os.path.basename(path)} ]")
             self._add_to_list(path)
             self.statusBar().showMessage(f"已载入：{path}（{len(text)} 字）")
@@ -356,7 +452,7 @@ class MainWindow(QMainWindow):
         for p in paths:
             self._add_to_list(p)
 
-    def _add_to_list(self, path):
+    def _add_to_list(self, path, persist=True):
         for i in range(self.playlist.count()):
             if self.playlist.item(i).data(Qt.UserRole) == path:
                 return
@@ -364,10 +460,23 @@ class MainWindow(QMainWindow):
         item.setData(Qt.UserRole, path)
         item.setToolTip(path)
         self.playlist.addItem(item)
+        if persist:
+            self._save_playlist()
 
     def _del_file(self):
         for item in self.playlist.selectedItems():
             self.playlist.takeItem(self.playlist.row(item))
+        self._save_playlist()
+
+    def _clear_playlist(self):
+        self.playlist.clear()
+        self._save_playlist()
+
+    def _save_playlist(self):
+        """朗读列表持久化，下次启动自动恢复。"""
+        self.cfg["playlist"] = [self.playlist.item(i).data(Qt.UserRole)
+                                for i in range(self.playlist.count())]
+        config.save(self.cfg)
 
     def _load_item(self, item):
         self._load_path(item.data(Qt.UserRole))
@@ -382,7 +491,7 @@ class MainWindow(QMainWindow):
             return
         self.start()
 
-    def start(self):
+    def start(self, from_begin=False):
         if not self.tts.configured():
             r = QMessageBox.question(self, "未配置 API Key",
                                      "需要先配置百度 API Key / Secret Key 才能朗读。\n现在打开设置吗？")
@@ -394,15 +503,21 @@ class MainWindow(QMainWindow):
         if not self.chunks:
             self.statusBar().showMessage("没有可朗读的文字")
             return
-        # 从光标所在段开始
-        pos = self.editor.textCursor().position()
-        start = 0
-        for i, (s, e, _) in enumerate(self.chunks):
-            if s <= pos < e:
-                start = i
-                break
-            if pos >= e:
-                start = i
+        # 从光标所在段开始（循环重读从头开始）
+        if from_begin:
+            start = 0
+            cur = self.editor.textCursor()
+            cur.setPosition(0)
+            self.editor.setTextCursor(cur)
+        else:
+            pos = self.editor.textCursor().position()
+            start = 0
+            for i, (s, e, _) in enumerate(self.chunks):
+                if s <= pos < e:
+                    start = i
+                    break
+                if pos >= e:
+                    start = i
         self.player.play(self.chunks, self._voice_params(), start,
                          self.spin_rounds.value())
 
@@ -421,11 +536,45 @@ class MainWindow(QMainWindow):
             self.btn_play.setText("▶ 播放")
             if state in ("finished", "stopped"):
                 self.editor.setExtraSelections([])
+                self.subtitle.clear_text()
+        if state == "finished":
+            QTimer.singleShot(0, self._after_finished)
+
+    def _after_finished(self):
+        """一遍读完（含设定遍数）后，按循环模式决定是否续读。"""
+        mode = self.cb_loop.currentData()
+        if mode == 1:            # 单文件循环：从头重读当前文件
+            self.start(from_begin=True)
+        elif mode == 2:          # 列表循环：读列表里的下一本
+            n = self.playlist.count()
+            if n == 0:
+                return
+            cur = -1
+            for i in range(n):
+                if self.playlist.item(i).data(Qt.UserRole) == self._cur_path:
+                    cur = i
+                    break
+            self._load_item(self.playlist.item((cur + 1) % n))
+            self.start()
+
+    def _toggle_subtitle(self, checked):
+        self.cfg["subtitle_on"] = bool(checked)
+        config.save(self.cfg)
+        if self.cfg.get("subtitle_on"):
+            if 0 <= self._cur_idx < len(self.chunks):
+                self.subtitle.set_text(self.chunks[self._cur_idx][2].strip())
+            else:
+                self.subtitle.set_text("桌面字幕已开启，开始朗读后显示当前句子")
+            self.subtitle.show()
+            self.subtitle.raise_()
+        else:
+            self.subtitle.hide()
 
     def _on_chunk(self, idx, total):
         if idx >= len(self.chunks):
             return
-        s, e, _ = self.chunks[idx]
+        self._cur_idx = idx
+        s, e, text = self.chunks[idx]
         sel = QTextEdit.ExtraSelection()
         sel.format.setBackground(QColor(self.cfg.get("hl_color", "#fff3a0")))
         cur = self.editor.textCursor()
@@ -436,6 +585,10 @@ class MainWindow(QMainWindow):
         c2 = self.editor.textCursor()
         c2.setPosition(s)
         self.editor.setTextCursor(c2)  # 滚动到可见
+        if self.cfg.get("subtitle_on"):
+            if not self.subtitle.isVisible():
+                self.subtitle.show()
+            self.subtitle.set_text(text.strip())
 
     def _on_error(self, msg):
         self._on_state("stopped")
@@ -499,5 +652,6 @@ class MainWindow(QMainWindow):
     def closeEvent(self, e):
         self.player.stop()
         self.playlist_win.hide()
+        self.subtitle.close()
         self._save_voice_cfg()
         super().closeEvent(e)

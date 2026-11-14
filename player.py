@@ -17,6 +17,69 @@ from PyQt5.QtCore import QObject, pyqtSignal
 
 PREFETCH = 5
 
+# pygame(SDL_mixer) 支持的伴音格式；其余（m4a/aac/wma）走 Windows MCI
+_PYGAME_EXT = {".mp3", ".ogg", ".wav", ".flac", ".opus", ".mod", ".it", ".xm",
+               ".s3m", ".mid", ".midi"}
+
+
+class MciBgm:
+    """用 Windows MCI(winmm) 播放 m4a/aac/wma —— SDL_mixer 不支持这些格式。"""
+
+    ALIAS = "reader_bgm"
+
+    def __init__(self):
+        import ctypes
+        self._mci = ctypes.windll.winmm.mciSendStringW
+        self._buf = ctypes.create_unicode_buffer(256)
+        self._opened = False
+
+    def _send(self, cmd, want_buf=False):
+        r = self._mci(cmd, self._buf if want_buf else 0, 256 if want_buf else 0, 0)
+        if r != 0:
+            err = self._buf
+            self._mci(f"close {self.ALIAS}", 0, 0, 0)
+            self._opened = False
+            raise RuntimeError(f"MCI({cmd.split()[0]}) 失败 {r}: {err.value}")
+        return self._buf.value if want_buf else ""
+
+    def open(self, path):
+        self.close()
+        self._send(f'open "{path}" type mpegvideo alias {self.ALIAS}')
+        self._opened = True
+
+    def play_loop(self):
+        self._send(f"play {self.ALIAS} repeat")
+
+    def set_volume(self, vol: float):
+        if self._opened:
+            try:
+                self._send(f"setaudio {self.ALIAS} volume to {int(max(0.0, min(1.0, vol)) * 1000)}")
+            except RuntimeError:
+                pass
+
+    def pause(self):
+        if self._opened:
+            self._send(f"pause {self.ALIAS}")
+
+    def resume(self):
+        if self._opened:
+            self._send(f"resume {self.ALIAS}")
+
+    def stop(self):
+        if self._opened:
+            try:
+                self._send(f"stop {self.ALIAS}")
+            except RuntimeError:
+                pass
+
+    def close(self):
+        if self._opened:
+            try:
+                self._mci(f"close {self.ALIAS}", 0, 0, 0)
+            except Exception:
+                pass
+            self._opened = False
+
 
 class Player(QObject):
     chunk_started = pyqtSignal(int, int)      # 当前段序号, 总段数
@@ -44,7 +107,9 @@ class Player(QObject):
         self._active = False             # 是否处于一次朗读会话中
         self._bgm = {"path": "", "vol": 0.3, "on": False}
         self._bgm_loaded = None
-        self._speech_ch = None           # 人声走通道；伴音走 music 流，二者互不干扰
+        self._bgm_engine = None          # None / "pygame" / "mci"
+        self._mci = None                 # m4a 等格式用 Windows MCI 播放
+        self._speech_ch = None           # 人声走通道；伴音走独立引擎，二者互不干扰
         try:
             pygame.mixer.init()
             self._mixer_ok = True
@@ -56,7 +121,10 @@ class Player(QObject):
     def set_bgm_volume(self, vol: float):
         """仅调音量（拖动滑杆用，极轻量，不处理开关）。"""
         self._bgm["vol"] = vol
-        if self._mixer_ok:
+        if self._bgm_engine == "mci" and self._mci:
+            with self._lock:
+                self._mci.set_volume(vol)
+        elif self._mixer_ok:
             with self._lock:
                 try:
                     pygame.mixer.music.set_volume(vol)
@@ -66,38 +134,70 @@ class Player(QObject):
     def set_bgm(self, path: str, vol: float, on: bool):
         """设置伴音。vol 0.0~1.0。播放中会实时生效。"""
         self._bgm = {"path": path, "vol": vol, "on": on}
-        if not self._mixer_ok:
-            return
         if not on:
             self._stop_bgm()
         elif self._active:
             self._start_bgm()
 
     def _start_bgm(self):
-        """伴音走 mixer.music 流：内存占用恒定，加载瞬时完成。"""
+        """按格式选引擎：pygame 流式播放；m4a/aac/wma 交给 Windows MCI。"""
         b = self._bgm
         path = b["path"]
-        if not (self._mixer_ok and b["on"] and path and os.path.exists(path)):
+        if not (b["on"] and path and os.path.exists(path)):
             return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _PYGAME_EXT:
+            if not self._mixer_ok:
+                return
+            self._stop_mci()
+            try:
+                with self._lock:
+                    if self._bgm_loaded != path or self._bgm_engine != "pygame":
+                        pygame.mixer.music.load(path)
+                        self._bgm_loaded = path
+                        self._bgm_engine = "pygame"
+                    pygame.mixer.music.set_volume(b["vol"])
+                    if not pygame.mixer.music.get_busy():
+                        pygame.mixer.music.play(loops=-1)
+            except pygame.error as e:
+                self.status_text.emit(f"伴音加载失败: {e}")
+            return
+
+        # ---- m4a / aac / wma：Windows MCI ----
         try:
+            if self._bgm_engine == "pygame":
+                with self._lock:
+                    try:
+                        pygame.mixer.music.stop()
+                    except pygame.error:
+                        pass
+            if self._mci is None:
+                self._mci = MciBgm()
             with self._lock:
-                if self._bgm_loaded != path:
-                    pygame.mixer.music.load(path)
+                if self._bgm_loaded != path or self._bgm_engine != "mci":
+                    self._mci.open(path)
                     self._bgm_loaded = path
-                pygame.mixer.music.set_volume(b["vol"])
-                if not pygame.mixer.music.get_busy():
-                    pygame.mixer.music.play(loops=-1)
-        except pygame.error as e:
-            self.status_text.emit(f"伴音加载失败: {e}")
+                    self._bgm_engine = "mci"
+                self._mci.set_volume(b["vol"])
+                self._mci.play_loop()
+        except Exception as e:
+            self._bgm_engine = None
+            self.status_text.emit(f"伴音加载失败（{ext} 需要系统解码器支持）: {e}")
+
+    def _stop_mci(self):
+        if self._mci:
+            with self._lock:
+                self._mci.stop()
 
     def _stop_bgm(self):
-        if not self._mixer_ok:
-            return
-        with self._lock:
-            try:
-                pygame.mixer.music.stop()
-            except pygame.error:
-                pass
+        if self._mci:
+            self._stop_mci()
+        if self._mixer_ok:
+            with self._lock:
+                try:
+                    pygame.mixer.music.stop()
+                except pygame.error:
+                    pass
 
     # ---------------- 公共控制 ----------------
     def play(self, chunks, voice: dict, start_idx: int = 0, rounds: int = 1):
@@ -127,9 +227,13 @@ class Player(QObject):
                 try:
                     if self._speech_ch:
                         self._speech_ch.pause()
-                    pygame.mixer.music.pause()
+                    if self._bgm_engine == "pygame":
+                        pygame.mixer.music.pause()
                 except pygame.error:
                     pass
+        if self._bgm_engine == "mci" and self._mci:
+            with self._lock:
+                self._mci.pause()
         self.state_changed.emit("paused")
 
     def resume(self):
@@ -139,9 +243,13 @@ class Player(QObject):
                 try:
                     if self._speech_ch:
                         self._speech_ch.unpause()
-                    pygame.mixer.music.unpause()
+                    if self._bgm_engine == "pygame":
+                        pygame.mixer.music.unpause()
                 except pygame.error:
                     pass
+        if self._bgm_engine == "mci" and self._mci:
+            with self._lock:
+                self._mci.resume()
         self.state_changed.emit("playing")
 
     def stop(self, join: bool = False):
@@ -266,7 +374,6 @@ class Player(QObject):
                     break
                 if self._paused:
                     self._speech_ch.pause()
-                    pygame.mixer.music.pause()
                     while self._paused and not self._stop.is_set():
                         time.sleep(0.05)
                     if self._stop.is_set():
@@ -275,7 +382,6 @@ class Player(QObject):
                         self._speech_ch.stop()
                         break
                     self._speech_ch.unpause()
-                    pygame.mixer.music.unpause()
                 time.sleep(0.05)
             if self._skip_to is not None:
                 continue

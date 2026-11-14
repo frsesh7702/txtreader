@@ -12,6 +12,7 @@ DEFAULTS = {
     "pit": 5,
     "vol": 10,
     "rounds": 1,
+    "playlist": [],       # 朗读列表里的 txt 路径，下次启动自动恢复
     "bgm_on": False,
     "bgm_path": "",
     "bgm_list": [],       # 最多 5 首备用音乐路径
@@ -24,6 +25,9 @@ DEFAULTS = {
     "hl_color": "#fff3a0",
     "doc_bg": "#ffffff",
     "para_spacing": 0,
+    "loop_mode": 0,       # 0=读完停止 1=单文件循环 2=列表循环
+    "subtitle_on": False, # 桌面字幕
+    "subtitle_size": 22,
 }
 
 
