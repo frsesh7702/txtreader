@@ -268,18 +268,24 @@ class Player(QObject):
                 t.join(timeout=2)
             self._threads = []
 
-    def skip(self, delta: int):
-        """跳到下一段/上一段。"""
+    def seek(self, idx: int):
+        """跳到指定段（进度条拖动用）。"""
         if not self._chunks:
             return
-        target = max(0, min(len(self._chunks) - 1, self._cur + delta))
-        self._skip_to = target
+        idx = max(0, min(len(self._chunks) - 1, int(idx)))
+        self._skip_to = idx
         if self._mixer_ok and self._speech_ch:
             with self._lock:
                 try:
                     self._speech_ch.stop()
                 except pygame.error:
                     pass
+
+    def skip(self, delta: int):
+        """跳到下一段/上一段。"""
+        if not self._chunks:
+            return
+        self.seek(self._cur + delta)
 
     @property
     def playing(self):

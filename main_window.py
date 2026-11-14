@@ -9,7 +9,7 @@ from PyQt5.QtWidgets import (QAction, QApplication, QComboBox, QDialog,
                              QFileDialog, QHBoxLayout, QLabel, QListWidget,
                              QListWidgetItem, QMainWindow, QMessageBox,
                              QProgressDialog, QPushButton, QSlider, QSpinBox,
-                             QTextEdit, QVBoxLayout, QWidget)
+                             QStyle, QTextEdit, QVBoxLayout, QWidget)
 
 import config
 from baidu_tts import BaiduTTS, VOICES, split_text
@@ -51,6 +51,37 @@ WELCOME = """使用须知：
 
 提示：把小说 txt 直接拖到本窗口也可以加入朗读列表。
 """
+
+
+class SeekSlider(QSlider):
+    """仿 PotPlayer 播放器的细黄线进度条：点击/拖动可直接跳转。"""
+
+    seek_requested = pyqtSignal(int)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self.maximum() > self.minimum():
+            self.setSliderDown(True)
+            self._jump(e.pos().x())
+            return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self.isSliderDown():
+            self._jump(e.pos().x())
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self.isSliderDown():
+            self.setSliderDown(False)
+            self.seek_requested.emit(self.value())
+            return
+        super().mouseReleaseEvent(e)
+
+    def _jump(self, x):
+        v = QStyle.sliderValueFromPosition(self.minimum(), self.maximum(),
+                                           x, max(1, self.width()))
+        self.setValue(v)
 
 
 class SubtitleWindow(QWidget):
@@ -221,6 +252,9 @@ class MainWindow(QMainWindow):
         self._connect_player()
         self.editor.setPlainText(WELCOME)
         self.editor.set_para_spacing(config.get_spacing(self.cfg))
+        _cur = self.editor.textCursor()
+        _cur.setPosition(0)
+        self.editor.setTextCursor(_cur)
 
         # 悬浮朗读列表窗口
         self.playlist_win = PlaylistWindow(self)
@@ -252,6 +286,31 @@ class MainWindow(QMainWindow):
         self.editor.set_appearance(int(self.cfg["font_size"]),
                                    self.cfg["text_color"], self.cfg["doc_bg"])
         root.addWidget(self.editor, 1)
+
+        # ---- 朗读进度条（仿 PotPlayer 细黄线，可拖动跳转）----
+        row_seek = QHBoxLayout()
+        row_seek.setContentsMargins(6, 0, 6, 0)
+        self.slider_progress = SeekSlider(Qt.Horizontal)
+        self.slider_progress.setRange(0, 0)
+        self.slider_progress.setFixedHeight(16)
+        self.slider_progress.setToolTip("拖动或点击黄线，可任意跳转朗读进度")
+        self.slider_progress.setStyleSheet("""
+            QSlider { background: transparent; }
+            QSlider::groove:horizontal { height: 3px; background: #6b5a12; border-radius: 1px; }
+            QSlider::sub-page:horizontal { height: 3px; background: #ffd400; border-radius: 1px; }
+            QSlider::add-page:horizontal { height: 3px; background: #6b5a12; border-radius: 1px; }
+            QSlider::handle:horizontal {
+                width: 12px; height: 12px; margin: -5px 0;
+                border-radius: 6px; background: #ffffff; border: 2px solid #ffd400;
+            }
+        """)
+        self.slider_progress.seek_requested.connect(self._on_seek)
+        row_seek.addWidget(self.slider_progress, 1)
+        self.lab_progress = QLabel("0 / 0 句")
+        self.lab_progress.setFixedWidth(80)
+        self.lab_progress.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row_seek.addWidget(self.lab_progress)
+        root.addLayout(row_seek)
 
         # ---- 播放控制行 ----
         row1 = QHBoxLayout()
@@ -415,6 +474,25 @@ class MainWindow(QMainWindow):
     def _new_doc(self):
         self.stop()
         self.editor.clear()
+        self._reset_progress()
+
+    def _reset_progress(self):
+        """新文本载入后清空进度条。"""
+        self.chunks = []
+        self._cur_idx = -1
+        self.slider_progress.setRange(0, 0)
+        self.slider_progress.setValue(0)
+        self.lab_progress.setText("0 / 0 句")
+        self.editor.setExtraSelections([])
+
+    def _on_seek(self, value):
+        """进度条跳转：播放中直接跳段，未播放时把光标移到该句。"""
+        if not self.chunks:
+            return
+        idx = max(0, min(len(self.chunks) - 1, int(value)))
+        if self._state in ("playing", "paused"):
+            self.player.seek(idx)
+        self._on_chunk(idx, len(self.chunks))
 
     def _open_file(self):
         path, _ = QFileDialog.getOpenFileName(self, "打开 TXT", "", "文本文件 (*.txt)")
@@ -434,7 +512,15 @@ class MainWindow(QMainWindow):
                 raise ValueError("无法识别文件编码")
             self.stop()
             self.editor.setPlainText(text)
+            cur = self.editor.textCursor()
+            cur.setPosition(0)            # 新文件从第一句开始读
+            self.editor.setTextCursor(cur)
             self._cur_path = path
+            self.chunks = split_text(text)
+            self.slider_progress.setRange(0, max(0, len(self.chunks) - 1))
+            self.slider_progress.setValue(0)
+            self.lab_progress.setText(f"0 / {len(self.chunks)} 句")
+            self._cur_idx = -1
             self.setWindowTitle(f"TXT 朗读器 1.0 [ {os.path.basename(path)} ]")
             self._add_to_list(path)
             self.statusBar().showMessage(f"已载入：{path}（{len(text)} 字）")
@@ -518,6 +604,9 @@ class MainWindow(QMainWindow):
                     break
                 if pos >= e:
                     start = i
+        self.slider_progress.setRange(0, max(0, len(self.chunks) - 1))
+        self.slider_progress.setValue(start)
+        self.lab_progress.setText(f"{start + 1} / {len(self.chunks)} 句")
         self.player.play(self.chunks, self._voice_params(), start,
                          self.spin_rounds.value())
 
@@ -585,6 +674,9 @@ class MainWindow(QMainWindow):
         c2 = self.editor.textCursor()
         c2.setPosition(s)
         self.editor.setTextCursor(c2)  # 滚动到可见
+        if not self.slider_progress.isSliderDown():
+            self.slider_progress.setValue(idx)
+        self.lab_progress.setText(f"{idx + 1} / {len(self.chunks)} 句")
         if self.cfg.get("subtitle_on"):
             if not self.subtitle.isVisible():
                 self.subtitle.show()
