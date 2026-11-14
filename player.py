@@ -11,6 +11,11 @@ import tempfile
 import threading
 import time
 
+try:
+    import audioop          # 用于人声峰值归一化（音量增强），C 实现，速度快
+except ImportError:         # Python 3.13+ 已移除
+    audioop = None
+
 os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
 import pygame
 from PyQt5.QtCore import QObject, pyqtSignal
@@ -128,6 +133,16 @@ class Player(QObject):
             with self._lock:
                 try:
                     pygame.mixer.music.set_volume(vol)
+                except pygame.error:
+                    pass
+
+    def set_voice_volume(self, vol15: float):
+        """实时调人声音量（0~15）。拖动音量条时立即生效，不必重新播放。"""
+        self._voice["vol"] = vol15
+        if self._mixer_ok and self._speech_ch:
+            with self._lock:
+                try:
+                    self._speech_ch.set_volume(max(0.05, min(1.0, vol15 / 15.0)))
                 except pygame.error:
                     pass
 
@@ -333,6 +348,29 @@ class Player(QObject):
             if not did_work:
                 time.sleep(0.15)
 
+    def _load_sound(self, path: str):
+        """加载人声并做响度归一化。
+
+        百度合成的语音峰值虽接近满刻度，但整体 RMS 只有 -16 dBFS 左右，听起来偏轻。
+        按响度把每句提到约 -12 dBFS（最多放大 2 倍），音量明显变大且句间响度一致。
+        """
+        snd = pygame.mixer.Sound(path)
+        if audioop is None:
+            return snd
+        try:
+            if pygame.mixer.get_init()[1] != -16:   # 非 16 位 PCM 不做处理
+                return snd
+            raw = snd.get_raw()
+            rms = audioop.rms(raw, 2)
+            if rms <= 0:
+                return snd
+            gain = min(2.0, 0.24 * 32767 / rms)
+            if gain <= 1.02:
+                return snd
+            return pygame.mixer.Sound(buffer=audioop.mul(raw, 2, gain))
+        except Exception:
+            return snd
+
     def _play_loop(self):
         if not self._mixer_ok:
             self.error.emit("音频设备初始化失败，无法播放")
@@ -366,13 +404,13 @@ class Player(QObject):
             self.chunk_started.emit(idx, len(self._chunks))
             self.status_text.emit(f"朗读中 第 {idx + 1}/{len(self._chunks)} 段")
             try:
-                snd = pygame.mixer.Sound(self._cache[idx])
+                snd = self._load_sound(self._cache[idx])
             except pygame.error as e:
                 self.error.emit(f"播放失败: {e}")
                 break
             vol = self._voice.get("vol", 5) / 15.0
             with self._lock:
-                self._speech_ch.set_volume(max(0.05, vol))
+                self._speech_ch.set_volume(max(0.05, min(1.0, vol)))
                 self._speech_ch.play(snd)
             # 播放中等待：同时监控 stop / skip / paused
             while self._speech_ch.get_busy() and not self._stop.is_set():

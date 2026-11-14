@@ -448,6 +448,7 @@ class MainWindow(QMainWindow):
             self.cfg[k] = s.value() + 5 if k == "spd" else s.value()
         self.cfg["rounds"] = self.spin_rounds.value()
         self.cfg["loop_mode"] = self.cb_loop.currentData()
+        self.player.set_voice_volume(self.sliders["vol"].value())  # 播放中即时生效
         config.save(self.cfg)
 
     # ---------------- 设置 / 朗读列表 ----------------
