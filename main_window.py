@@ -212,6 +212,29 @@ class BackgroundTextEdit(QTextEdit):
         super().setPlainText(text)
         self.set_para_spacing(self._spacing)  # 新文本块恢复默认格式，需重设
 
+    def contextMenuEvent(self, e):
+        """右键：自动选中点击处的词语，并弹出中文编辑菜单（复制/粘贴/全选等）。"""
+        if not self.textCursor().hasSelection():
+            cur = self.cursorForPosition(e.pos())
+            cur.select(QTextCursor.WordUnderCursor)
+            self.setTextCursor(cur)
+        has_sel = self.textCursor().hasSelection()
+        editable = not self.isReadOnly()
+        menu = QMenu(self)
+        for text, slot, enabled in (
+            ("复制", self.copy, has_sel),
+            ("剪切", self.cut, has_sel and editable),
+            ("粘贴", self.paste, self.canPaste() and editable),
+            ("删除", self._delete_selection, has_sel and editable),
+            ("全选", self.selectAll, True),
+        ):
+            act = menu.addAction(text, slot)
+            act.setEnabled(enabled)
+        menu.exec_(e.globalPos())
+
+    def _delete_selection(self):
+        self.textCursor().removeSelectedText()
+
     def set_appearance(self, size: int, text_color: str, base_color: str):
         """字体大小 + 文字颜色 + 文档底色（背景图融合基色）。"""
         self.setFont(QFont("Microsoft YaHei", size))
